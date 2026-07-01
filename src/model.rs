@@ -306,7 +306,8 @@ impl OJP {
     }
 
     /// Finds `number_results` trips from a list of departures and arrivals at `date_time` using the OJP API.
-    /// The length of `departures` and `arrivals` must be the same.
+    /// The length of `departures` and `arrivals` must be the same; if they differ, only pairs up
+    /// to the shorter length are queried and a warning is logged.
     /// The name of the environment variable needs to be profived through the varibale `api_key`.
     pub async fn find_trips(
         departures: &[i32],
@@ -316,6 +317,16 @@ impl OJP {
         requestor_ref: &str,
         api_key: &str,
     ) -> Vec<Result<SimplifiedTrip, OjpError>> {
+        if departures.len() != arrivals.len() {
+            let span = span!(Level::WARN, "find_trips length mismatch");
+            let _guard = span.enter();
+            tracing::warn!(
+                "departures ({}) and arrivals ({}) have different lengths; only the first {} pair(s) will be queried, the rest are dropped",
+                departures.len(),
+                arrivals.len(),
+                departures.len().min(arrivals.len())
+            );
+        }
         let ref_trips: Vec<_> = departures
             .iter()
             .zip(arrivals.iter())
@@ -650,7 +661,7 @@ impl Trip {
         self.start_time.naive_utc()
     }
 
-    pub fn arrival_time_time(&self) -> NaiveDateTime {
+    pub fn arrival_time(&self) -> NaiveDateTime {
         self.end_time.naive_utc()
     }
 
@@ -1502,6 +1513,28 @@ mod test {
         assert_eq!(super::sloid_to_didok("ch:1:sloid:4106").unwrap(), 8504106);
         assert_eq!(super::sloid_to_didok("de:1:sloid:42").unwrap(), 8000042);
         assert!(super::sloid_to_didok("not-a-sloid").is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn find_trips_truncates_on_length_mismatch() {
+        let date_time = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2025, 6, 1).unwrap(),
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        );
+        // Mismatched lengths: 2 departures, 1 arrival. A deliberately nonexistent env var name is
+        // used for `api_key` so this never makes a real network call (token lookup fails first) --
+        // we only care that the returned Vec's length matches the shorter input rather than
+        // silently including a spurious element or panicking.
+        let results = OJP::find_trips(
+            &[1, 2],
+            &[10],
+            date_time,
+            1,
+            "Test",
+            "OJP_RS_TEST_NONEXISTENT_TOKEN_VAR",
+        )
+        .await;
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
