@@ -3,7 +3,7 @@ use std::env::VarError;
 use std::fmt::Display;
 use std::num::ParseIntError;
 
-use chrono::{DateTime, Duration, NaiveDateTime, TimeDelta, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeDelta, Utc};
 use futures::future::join_all;
 use quick_xml::DeError;
 use secrecy::SecretString;
@@ -416,12 +416,15 @@ impl OJP {
         )
     }
 
-    /// Returns all trips from the OJP response that are starting after `date_time`
+    /// Returns all trips from the OJP response that are starting after `date_time`.
+    /// `date_time` is interpreted as local wall-clock time, consistent with
+    /// `RequestBuilder::try_new`.
     pub fn trips_departing_after(&self, date_time: NaiveDateTime) -> Option<Vec<&TripResult>> {
+        let date_time_utc = date_time.and_local_timezone(Local).single()?.naive_utc();
         let res = self
             .trips()?
             .into_iter()
-            .filter(|&t| t.trip.start_time.naive_utc() >= date_time)
+            .filter(|&t| t.trip.start_time.naive_utc() >= date_time_utc)
             .collect::<Vec<_>>();
         if res.is_empty() { None } else { Some(res) }
     }
@@ -1430,7 +1433,7 @@ struct PlaceMode {
 #[cfg(test)]
 mod test {
     use crate::{OJP, RequestBuilder, RequestType, SimplifiedLeg, SimplifiedTrip, token};
-    use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
+    use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
     use std::error::Error;
     use test_log::test;
 
@@ -1529,12 +1532,14 @@ mod test {
         let ojp = parse_xml("test_xml/trip_simple.xml").unwrap();
         let fastest_trip = ojp.fastest_trip().unwrap();
         assert_eq!(fastest_trip.duration.num_seconds(), 3 * 60 + 30);
-        let trip_after = ojp
-            .trip_departing_after(
-                NaiveDateTime::parse_from_str("2025-10-17T09:00:00Z", FORMAT).unwrap(),
-                0,
-            )
-            .unwrap();
+
+        // `trip_departing_after`/`trips_departing_after` interpret their `date_time` argument as
+        // local wall-clock time; convert the UTC threshold we care about to its local-time
+        // equivalent so the test is correct regardless of the host's timezone.
+        let threshold_utc = NaiveDateTime::parse_from_str("2025-10-17T09:00:00Z", FORMAT).unwrap();
+        let threshold_local = threshold_utc.and_utc().with_timezone(&Local).naive_local();
+
+        let trip_after = ojp.trip_departing_after(threshold_local, 0).unwrap();
 
         assert_eq!(
             trip_after.start_time.naive_utc(),
@@ -1559,14 +1564,7 @@ mod test {
 
         let trips = ojp.trips().unwrap();
         assert_eq!(trips.len(), 3);
-        assert_eq!(
-            ojp.trips_departing_after(
-                NaiveDateTime::parse_from_str("2025-10-17T09:00:00Z", FORMAT).unwrap(),
-            )
-            .unwrap()
-            .len(),
-            2
-        );
+        assert_eq!(ojp.trips_departing_after(threshold_local).unwrap().len(), 2);
     }
 
     #[test]
