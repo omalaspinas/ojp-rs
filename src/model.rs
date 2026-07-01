@@ -1,7 +1,7 @@
 #![allow(dead_code)]
+use std::env::VarError;
 use std::fmt::Display;
 use std::num::ParseIntError;
-use std::{env::VarError, io::Write};
 
 use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeDelta};
 use futures::future::join_all;
@@ -207,7 +207,7 @@ impl OJP {
         requestor_ref: &str,
         api_key: &str,
     ) -> Result<Vec<i32>, OjpError> {
-        let response = RequestBuilder::new(date_time)
+        let response = RequestBuilder::try_new(date_time)?
             .set_token(token(api_key)?)
             .set_name(location)
             .set_number_results(number_results)
@@ -286,7 +286,7 @@ impl OJP {
         requestor_ref: &str,
         api_key: &str,
     ) -> Result<SimplifiedTrip, OjpError> {
-        let response = RequestBuilder::new(date_time)
+        let response = RequestBuilder::try_new(date_time)?
             .set_token(token(api_key)?)
             .set_from(from_id)
             .set_to(to_id)
@@ -300,8 +300,6 @@ impl OJP {
             let span = span!(Level::WARN, "From response error");
             let _guard = span.enter();
             tracing::error!("{e}");
-            let mut file = std::fs::File::create("debug.xml").unwrap();
-            file.write_all(response.as_bytes()).unwrap();
         })?;
         let ojp = if let Some(msg) = ojp.error() {
             Err(OjpError::FailedToFindTrip {
@@ -325,8 +323,6 @@ impl OJP {
             let span = span!(Level::WARN, "From ref_trip error");
             let _guard = span.enter();
             tracing::error!("{e}");
-            let mut file = std::fs::File::create("debug_simplified.xml").unwrap();
-            file.write_all(response.as_bytes()).unwrap();
         })
     }
 
@@ -733,11 +729,13 @@ impl SimplifiedTrip {
         }
 
         // departure and arrival time must be approximately the same with respect to duration
-        if (self.departure_time() - rhs.departure_time()).as_seconds_f64()
-            / self.duration().as_seconds_f64()
+        if ((self.departure_time() - rhs.departure_time()).as_seconds_f64()
+            / self.duration().as_seconds_f64())
+        .abs()
             > tolerance
-            || (self.arrival_time() - rhs.arrival_time()).as_seconds_f64()
-                / self.duration().as_seconds_f64()
+            || ((self.arrival_time() - rhs.arrival_time()).as_seconds_f64()
+                / self.duration().as_seconds_f64())
+            .abs()
                 > tolerance
         {
             return false;
@@ -1279,7 +1277,7 @@ pub struct PlaceResult {
 
 impl PlaceResult {
     pub fn stop_place_ref(&self) -> Option<i32> {
-        Some(self.place.stop_place.as_ref()?.stop_place_ref)
+        self.place.stop_place.as_ref()?.id().ok()
     }
 
     pub fn stop_place_name(&self) -> Option<&str> {
@@ -1319,10 +1317,20 @@ struct TopographicPlace {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "PascalCase")]
 struct StopPlace {
-    stop_place_ref: i32,
+    stop_place_ref: String,
     stop_place_name: Text,
     private_code: PrivateCode,
     topographic_place_ref: String,
+}
+
+impl StopPlace {
+    pub fn id(&self) -> Result<i32, OjpError> {
+        if let Ok(num) = self.stop_place_ref.parse::<i32>() {
+            Ok(num)
+        } else {
+            sloid_to_didok(&self.stop_place_ref)
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -1414,7 +1422,8 @@ mod test {
             NaiveDate::from_ymd_opt(2025, 11, 19).unwrap(),
             NaiveTime::from_hms_milli_opt(20, 56, 28, 643).unwrap(),
         );
-        let response = RequestBuilder::new(date_time)
+        let response = RequestBuilder::try_new(date_time)
+            .unwrap()
             .set_token(token("TOKEN").unwrap())
             .set_requestor_ref("Test")
             .set_name("bern s")
@@ -1434,7 +1443,8 @@ mod test {
             NaiveDate::from_ymd_opt(2025, 11, 19).unwrap(),
             NaiveTime::from_hms_milli_opt(20, 56, 28, 643).unwrap(),
         );
-        let response = RequestBuilder::new(date_time)
+        let response = RequestBuilder::try_new(date_time)
+            .unwrap()
             .set_token(token("TOKEN").unwrap())
             .set_requestor_ref("Test")
             .set_number_results(3)

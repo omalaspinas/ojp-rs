@@ -36,6 +36,10 @@ pub enum RequestError {
     InvalidNumberResults(u32),
     #[error("Http request error: {0}")]
     ReqwestError(#[from] reqwest::Error),
+    #[error(
+        "{0} is not a valid local time for the current timezone offset (falls in a DST gap or overlap)"
+    )]
+    InvalidLocalDateTime(NaiveDateTime),
 }
 
 impl TryFrom<RequestType> for String {
@@ -63,16 +67,17 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    pub fn new(date_time: NaiveDateTime) -> Self {
+    pub fn try_new(date_time: NaiveDateTime) -> Result<Self, RequestError> {
         // We convert NaiveDateTime to Utc through Local (for the offset)
         // First we get the "now" local time (used for the offset)
         // and add it to the NaiveDateTime
-        let date_time = date_time
+        let local_date_time = date_time
             .and_local_timezone(*Local::now().offset())
-            .unwrap();
+            .single()
+            .ok_or(RequestError::InvalidLocalDateTime(date_time))?;
 
-        let date_time = date_time.to_utc();
-        RequestBuilder {
+        let date_time = local_date_time.to_utc();
+        Ok(RequestBuilder {
             date_time,
             token: None,
             request_type: RequestType::Unknown,
@@ -81,7 +86,7 @@ impl RequestBuilder {
             to: None,
             name: None,
             requestor_ref: String::new(),
-        }
+        })
     }
 
     pub fn set_from(mut self, from: i32) -> Self {
@@ -130,21 +135,23 @@ impl RequestBuilder {
                 if number_results == 0 {
                     return Err(RequestError::InvalidNumberResults(number_results));
                 }
-                if self.name.is_none() {
+                let Some(name) = self.name.as_ref() else {
                     return Err(RequestError::MissingLocationName);
-                }
+                };
+                let requestor_ref = quick_xml::escape::escape(self.requestor_ref.as_str());
+                let name = quick_xml::escape::escape(name.as_str());
                 let req = format!(
 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
                             <OJP xmlns=\"http://www.vdv.de/ojp\" xmlns:siri=\"http://www.siri.org.uk/siri\" version=\"2.0\">
                              	<OJPRequest>
                                     <siri:ServiceRequest>
                                         <siri:RequestTimestamp>{now}</siri:RequestTimestamp>
-                                        <siri:RequestorRef>{}</siri:RequestorRef>
+                                        <siri:RequestorRef>{requestor_ref}</siri:RequestorRef>
                                         <OJPLocationInformationRequest>
                                         <siri:RequestTimestamp>{now}</siri:RequestTimestamp>
                                         <siri:MessageIdentifier>LIR-1a</siri:MessageIdentifier>
                                         <InitialInput>
-                                            <Name>{}</Name>
+                                            <Name>{name}</Name>
                                         </InitialInput>
                                         <Restrictions>
                                             <Type>stop</Type>
@@ -153,7 +160,7 @@ impl RequestBuilder {
                                     </OJPLocationInformationRequest>
                                     </siri:ServiceRequest>
                                 </OJPRequest>
-                            </OJP>", self.requestor_ref, self.name.as_ref().unwrap());
+                            </OJP>");
                 Ok(req)
             }
             RequestType::StopEvent => Err(RequestError::EventsRequestTypeNotImplemented),
@@ -167,12 +174,13 @@ impl RequestBuilder {
                     (Some(_), None) => return Err(RequestError::MissingToId),
                     (None, Some(_)) => return Err(RequestError::MissingFromId),
                 };
+                let requestor_ref = quick_xml::escape::escape(self.requestor_ref.as_str());
                 let req = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>
                             <OJP xmlns=\"http://www.vdv.de/ojp\" xmlns:siri=\"http://www.siri.org.uk/siri\" version=\"2.0\">
                              	<OJPRequest>
                                     <siri:ServiceRequest>
                                         <siri:RequestTimestamp>{now}</siri:RequestTimestamp>
-                                        <siri:RequestorRef>{}</siri:RequestorRef>
+                                        <siri:RequestorRef>{requestor_ref}</siri:RequestorRef>
                                         <OJPTripRequest>
                                             <siri:RequestTimestamp>{now}</siri:RequestTimestamp>
                                             <siri:MessageIdentifier>TR-1r1</siri:MessageIdentifier>
@@ -193,7 +201,7 @@ impl RequestBuilder {
                                         </OJPTripRequest>
                                     </siri:ServiceRequest>
                                 </OJPRequest>
-                            </OJP>", self.requestor_ref);
+                            </OJP>");
                 Ok(req)
             }
         }
