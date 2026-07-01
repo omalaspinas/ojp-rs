@@ -1363,8 +1363,8 @@ struct PlaceMode {
 
 #[cfg(test)]
 mod test {
-    use crate::{OJP, RequestBuilder, RequestType, token};
-    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+    use crate::{OJP, RequestBuilder, RequestType, SimplifiedLeg, SimplifiedTrip, token};
+    use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
     use std::error::Error;
     use test_log::test;
 
@@ -1374,6 +1374,56 @@ mod test {
         let ojp = super::OJP::try_from(xml.as_str())?;
         Ok(ojp)
     }
+
+    #[test]
+    fn sloid_to_didok_converts_known_examples() {
+        // Real StopPlaceRef seen from the live API for "Bern Bümpliz Süd".
+        assert_eq!(super::sloid_to_didok("ch:1:sloid:4106").unwrap(), 8504106);
+        assert_eq!(super::sloid_to_didok("de:1:sloid:42").unwrap(), 8000042);
+        assert!(super::sloid_to_didok("not-a-sloid").is_err());
+    }
+
+    fn one_hour_trip_departing_at(departure: NaiveDateTime) -> SimplifiedTrip {
+        SimplifiedTrip::new(vec![SimplifiedLeg::new(
+            1,
+            "A",
+            2,
+            "B",
+            departure,
+            departure + Duration::hours(1),
+            "rail".to_string(),
+        )])
+    }
+
+    #[test]
+    fn approx_equal_detects_time_mismatch_regardless_of_direction() {
+        let base_departure = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2025, 6, 1).unwrap(),
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        );
+        let earlier = one_hour_trip_departing_at(base_departure);
+        let later = one_hour_trip_departing_at(base_departure + Duration::seconds(1000));
+
+        // `earlier` departs well before `later` (>1% of the 1h duration apart); this must not
+        // be considered approximately equal regardless of comparison order.
+        assert!(!earlier.approx_equal(&later, 0.01));
+        assert!(!later.approx_equal(&earlier, 0.01));
+    }
+
+    #[test]
+    fn approx_equal_accepts_trips_within_tolerance() {
+        let base_departure = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2025, 6, 1).unwrap(),
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        );
+        let on_time = one_hour_trip_departing_at(base_departure);
+        // 10s off a 1h (3600s) trip is well within a 1% tolerance (36s).
+        let slightly_late = one_hour_trip_departing_at(base_departure + Duration::seconds(10));
+
+        assert!(on_time.approx_equal(&slightly_late, 0.01));
+        assert!(slightly_late.approx_equal(&on_time, 0.01));
+    }
+
     #[test]
     fn location_coordinate() {
         let _ojp = parse_xml("test_xml/location_coordinate.xml").unwrap();

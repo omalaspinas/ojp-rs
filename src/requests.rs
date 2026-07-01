@@ -68,11 +68,11 @@ pub struct RequestBuilder {
 
 impl RequestBuilder {
     pub fn try_new(date_time: NaiveDateTime) -> Result<Self, RequestError> {
-        // We convert NaiveDateTime to Utc through Local (for the offset)
-        // First we get the "now" local time (used for the offset)
-        // and add it to the NaiveDateTime
+        // We convert NaiveDateTime to Utc through Local (for the offset). `Local` resolves the
+        // offset that applies to `date_time` itself (accounting for DST rules across the year),
+        // rather than the offset currently in effect.
         let local_date_time = date_time
-            .and_local_timezone(*Local::now().offset())
+            .and_local_timezone(Local)
             .single()
             .ok_or(RequestError::InvalidLocalDateTime(date_time))?;
 
@@ -281,5 +281,91 @@ impl Display for RequestBuilder {
             "NumberResults: {}, DateTime: {}, RequestorRef: {}, Token: {token}",
             self.number_results, self.date_time, self.requestor_ref
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use chrono::{NaiveDate, NaiveTime};
+
+    fn sample_date_time() -> NaiveDateTime {
+        NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2025, 7, 15).unwrap(),
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        )
+    }
+
+    #[test]
+    fn location_request_escapes_special_characters() {
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::LocationInformation)
+            .set_requestor_ref("<ref>&\"'")
+            .set_name("<name>&\"'")
+            .set_number_results(1)
+            .try_request_body()
+            .unwrap();
+
+        assert!(
+            body.contains("<siri:RequestorRef>&lt;ref&gt;&amp;&quot;&apos;</siri:RequestorRef>")
+        );
+        assert!(body.contains("<Name>&lt;name&gt;&amp;&quot;&apos;</Name>"));
+    }
+
+    #[test]
+    fn location_request_name_cannot_inject_sibling_elements() {
+        // Attempts to close </Name></InitialInput> early and splice in a sibling element.
+        let malicious = "</Name></InitialInput><Injected>pwned</Injected><InitialInput><Name>x";
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::LocationInformation)
+            .set_requestor_ref("ref")
+            .set_name(malicious)
+            .set_number_results(1)
+            .try_request_body()
+            .unwrap();
+
+        assert!(!body.contains("<Injected>"));
+        assert_eq!(body.matches("<InitialInput>").count(), 1);
+    }
+
+    #[test]
+    fn trip_request_escapes_requestor_ref() {
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::Trip)
+            .set_requestor_ref("<ref>&")
+            .set_from(1)
+            .set_to(2)
+            .set_number_results(1)
+            .try_request_body()
+            .unwrap();
+
+        assert!(body.contains("<siri:RequestorRef>&lt;ref&gt;&amp;</siri:RequestorRef>"));
+    }
+
+    #[test]
+    fn try_new_resolves_offset_for_given_date_not_now() {
+        // Regression test: try_new must resolve the UTC offset that applies to `date_time`
+        // itself (via `Local`), not the offset currently in effect (via `Local::now()`).
+        let date_time = sample_date_time();
+        let expected_utc = date_time
+            .and_local_timezone(Local)
+            .single()
+            .unwrap()
+            .to_utc();
+        let expected = expected_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+
+        let body = RequestBuilder::try_new(date_time)
+            .unwrap()
+            .set_request_type(RequestType::Trip)
+            .set_from(1)
+            .set_to(2)
+            .set_number_results(1)
+            .try_request_body()
+            .unwrap();
+
+        assert!(body.contains(&format!("<DepArrTime>{expected}</DepArrTime>")));
     }
 }
