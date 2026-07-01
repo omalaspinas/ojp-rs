@@ -417,8 +417,7 @@ impl OJP {
     }
 
     /// Returns all trips from the OJP response that are starting after `date_time`.
-    /// `date_time` is interpreted as local wall-clock time, consistent with
-    /// `RequestBuilder::try_new`.
+    /// `date_time` is interpreted as local wall-clock time
     pub fn trips_departing_after(&self, date_time: NaiveDateTime) -> Option<Vec<&TripResult>> {
         let date_time_utc = date_time.and_local_timezone(Local).single()?.naive_utc();
         let res = self
@@ -714,14 +713,18 @@ pub struct SimplifiedTrip {
     legs: Vec<SimplifiedLeg>,
 }
 
+fn utc_naive_to_local(utc_naive: NaiveDateTime) -> NaiveDateTime {
+    utc_naive.and_utc().with_timezone(&Local).naive_local()
+}
+
 impl Display for SimplifiedTrip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(
             f,
             "Trip from: {} to: {} departing at: {}",
-            self.departure_stop(),
-            self.arrival_stop(),
-            self.departure_time()
+            self.departure_stop().map_err(|_| std::fmt::Error)?,
+            self.arrival_stop().map_err(|_| std::fmt::Error)?,
+            utc_naive_to_local(self.departure_time().map_err(|_| std::fmt::Error)?)
         )?;
         self.legs().iter().try_for_each(|l| {
             writeln!(
@@ -730,72 +733,119 @@ impl Display for SimplifiedTrip {
                 l.mode,
                 l.departure_stop,
                 l.arrival_stop,
-                l.departure_time.format("%H:%M"),
-                l.arrival_time.format("%H:%M")
+                utc_naive_to_local(l.departure_time).format("%H:%M"),
+                utc_naive_to_local(l.arrival_time).format("%H:%M")
             )
         })
     }
 }
 
 impl SimplifiedTrip {
-    pub fn new(legs: Vec<SimplifiedLeg>) -> Self {
-        SimplifiedTrip { legs }
+    /// Fails if `legs` is empty: a `SimplifiedTrip` with no legs has no well-defined departure
+    /// or arrival, and every accessor below relies on at least one leg being present.
+    pub fn try_new(legs: Vec<SimplifiedLeg>) -> Result<Self, OjpError> {
+        if legs.is_empty() {
+            return Err(OjpError::FailedToConvertToSimplifiedTrip);
+        }
+        Ok(SimplifiedTrip { legs })
     }
+
     pub fn legs(&self) -> Vec<&SimplifiedLeg> {
         self.legs.iter().collect()
     }
 
-    pub fn departure_time(&self) -> NaiveDateTime {
-        self.legs().first().map(|l| l.departure_time).unwrap()
+    pub fn departure_time(&self) -> Result<NaiveDateTime, OjpError> {
+        self.legs()
+            .first()
+            .map(|l| l.departure_time)
+            .ok_or(OjpError::FailedToConvertToSimplifiedTrip)
     }
 
-    pub fn arrival_time(&self) -> NaiveDateTime {
-        self.legs().last().map(|l| l.arrival_time).unwrap()
+    pub fn arrival_time(&self) -> Result<NaiveDateTime, OjpError> {
+        self.legs()
+            .last()
+            .map(|l| l.arrival_time)
+            .ok_or(OjpError::FailedToConvertToSimplifiedTrip)
     }
 
-    pub fn duration(&self) -> TimeDelta {
-        self.arrival_time() - self.departure_time()
+    pub fn duration(&self) -> Result<TimeDelta, OjpError> {
+        Ok(self.arrival_time()? - self.departure_time()?)
     }
 
-    pub fn departure_id(&self) -> i32 {
-        self.legs().first().map(|l| l.departure_id).unwrap()
+    pub fn departure_id(&self) -> Result<i32, OjpError> {
+        self.legs()
+            .first()
+            .map(|l| l.departure_id)
+            .ok_or(OjpError::FailedToConvertToSimplifiedTrip)
     }
 
-    pub fn arrival_id(&self) -> i32 {
-        self.legs().last().map(|l| l.arrival_id).unwrap()
+    pub fn arrival_id(&self) -> Result<i32, OjpError> {
+        self.legs()
+            .last()
+            .map(|l| l.arrival_id)
+            .ok_or(OjpError::FailedToConvertToSimplifiedTrip)
     }
 
-    pub fn departure_stop(&self) -> &str {
+    pub fn departure_stop(&self) -> Result<&str, OjpError> {
         self.legs()
             .first()
             .map(|l| l.departure_stop.as_str())
-            .unwrap()
+            .ok_or(OjpError::FailedToConvertToSimplifiedTrip)
     }
 
-    pub fn arrival_stop(&self) -> &str {
-        self.legs().last().map(|l| l.arrival_stop.as_str()).unwrap()
+    pub fn arrival_stop(&self) -> Result<&str, OjpError> {
+        self.legs()
+            .last()
+            .map(|l| l.arrival_stop.as_str())
+            .ok_or(OjpError::FailedToConvertToSimplifiedTrip)
     }
 
     pub fn approx_equal(&self, rhs: &SimplifiedTrip, tolerance: f64) -> bool {
+        let (Ok(self_departure_id), Ok(self_arrival_id), Ok(rhs_departure_id), Ok(rhs_arrival_id)) = (
+            self.departure_id(),
+            self.arrival_id(),
+            rhs.departure_id(),
+            rhs.arrival_id(),
+        ) else {
+            return false;
+        };
         // deprature and arrival must be the same
-        if self.departure_id() != rhs.departure_id() || self.arrival_id() != rhs.arrival_id() {
+        if self_departure_id != rhs_departure_id || self_arrival_id != rhs_arrival_id {
             return false;
         }
+
+        let (Ok(self_duration), Ok(rhs_duration)) = (self.duration(), rhs.duration()) else {
+            return false;
+        };
         // duration must be approximately equal
-        if (self.duration().as_seconds_f64() - rhs.duration().as_seconds_f64()).abs()
-            / rhs.duration().as_seconds_f64()
+        if (self_duration.as_seconds_f64() - rhs_duration.as_seconds_f64()).abs()
+            / rhs_duration.as_seconds_f64()
             > tolerance
         {
             return false;
         }
 
+        let (
+            Ok(self_departure_time),
+            Ok(self_arrival_time),
+            Ok(rhs_departure_time),
+            Ok(rhs_arrival_time),
+        ) = (
+            self.departure_time(),
+            self.arrival_time(),
+            rhs.departure_time(),
+            rhs.arrival_time(),
+        )
+        else {
+            return false;
+        };
         // departure and arrival time must be approximately the same with respect to duration
-        if ((self.departure_time() - rhs.departure_time()).as_seconds_f64()
-            / self.duration().as_seconds_f64())
+        if ((self_departure_time - rhs_departure_time).as_seconds_f64()
+            / self_duration.as_seconds_f64())
         .abs()
             > tolerance
-            || ((self.arrival_time() - rhs.arrival_time()).as_seconds_f64()
-                / self.duration().as_seconds_f64())
+            || ((self_arrival_time - rhs_arrival_time).as_seconds_f64()
+                / self_duration.as_seconds_f64())
             .abs()
                 > tolerance
         {
@@ -834,7 +884,7 @@ impl TryFrom<&Trip> for SimplifiedTrip {
                 ))
             })
             .collect::<Result<Vec<_>, OjpError>>()?;
-        Ok(SimplifiedTrip { legs: st })
+        SimplifiedTrip::try_new(st)
     }
 }
 
@@ -1432,7 +1482,7 @@ struct PlaceMode {
 
 #[cfg(test)]
 mod test {
-    use crate::{OJP, RequestBuilder, RequestType, SimplifiedLeg, SimplifiedTrip, token};
+    use crate::{OJP, OjpError, RequestBuilder, RequestType, SimplifiedLeg, SimplifiedTrip, token};
     use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
     use std::error::Error;
     use test_log::test;
@@ -1454,8 +1504,61 @@ mod test {
         assert!(super::sloid_to_didok("not-a-sloid").is_err());
     }
 
+    #[test]
+    fn simplified_trip_try_new_rejects_empty_legs() {
+        assert!(matches!(
+            SimplifiedTrip::try_new(vec![]),
+            Err(OjpError::FailedToConvertToSimplifiedTrip)
+        ));
+    }
+
+    #[test]
+    fn simplified_trip_accessors_error_on_empty_legs() {
+        // Bypasses `try_new` (possible here since the test module is nested inside `model` and
+        // can see private fields) to confirm the accessors themselves stay defensive -- returning
+        // an error rather than panicking -- even if the non-empty invariant is ever violated by a
+        // future construction path.
+        let empty = super::SimplifiedTrip { legs: vec![] };
+        assert!(empty.departure_time().is_err());
+        assert!(empty.arrival_time().is_err());
+        assert!(empty.departure_id().is_err());
+        assert!(empty.arrival_id().is_err());
+        assert!(empty.departure_stop().is_err());
+        assert!(empty.arrival_stop().is_err());
+        assert!(empty.duration().is_err());
+        assert!(!empty.approx_equal(&empty, 0.01));
+    }
+
+    #[test]
+    fn display_shows_local_time_not_utc() {
+        // SimplifiedLeg/SimplifiedTrip store naive UTC times; Display is the human-facing
+        // summary (used e.g. by examples/find_journeys.rs) and must show local wall-clock time.
+        let departure_utc = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2025, 7, 15).unwrap(),
+            NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+        );
+        let arrival_utc = departure_utc + Duration::hours(1);
+        let trip = SimplifiedTrip::try_new(vec![SimplifiedLeg::new(
+            1,
+            "A",
+            2,
+            "B",
+            departure_utc,
+            arrival_utc,
+            "rail".to_string(),
+        )])
+        .unwrap();
+
+        let expected_departure_local = super::utc_naive_to_local(departure_utc);
+        let expected_arrival_local = super::utc_naive_to_local(arrival_utc);
+        let printed = trip.to_string();
+
+        assert!(printed.contains(&expected_departure_local.format("%H:%M").to_string()));
+        assert!(printed.contains(&expected_arrival_local.format("%H:%M").to_string()));
+    }
+
     fn one_hour_trip_departing_at(departure: NaiveDateTime) -> SimplifiedTrip {
-        SimplifiedTrip::new(vec![SimplifiedLeg::new(
+        SimplifiedTrip::try_new(vec![SimplifiedLeg::new(
             1,
             "A",
             2,
@@ -1464,6 +1567,7 @@ mod test {
             departure + Duration::hours(1),
             "rail".to_string(),
         )])
+        .unwrap()
     }
 
     #[test]
@@ -1554,11 +1658,11 @@ mod test {
 
         let simplified_trip = SimplifiedTrip::try_from(trip_after).unwrap();
         assert_eq!(
-            simplified_trip.departure_time(),
+            simplified_trip.departure_time().unwrap(),
             NaiveDateTime::parse_from_str("2025-10-17T09:07:24Z", FORMAT).unwrap()
         );
         assert_eq!(
-            simplified_trip.arrival_time(),
+            simplified_trip.arrival_time().unwrap(),
             NaiveDateTime::parse_from_str("2025-10-17T09:10:54Z", FORMAT).unwrap()
         );
 

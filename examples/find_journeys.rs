@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "Glaris",
     ];
     let date_time = Local::now().naive_local();
+    println!("{date_time:?}");
     let res = find_trips(&test_cities, 5, date_time).await?;
     for r in res {
         println!("{}", r);
