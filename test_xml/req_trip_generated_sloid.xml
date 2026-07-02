@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OJP xmlns="http://www.vdv.de/ojp" xmlns:siri="http://www.siri.org.uk/siri" version="2.0">
+    <OJPRequest>
+        <siri:ServiceRequest>
+            <siri:RequestTimestamp>2026-07-02T08:00:00.000Z</siri:RequestTimestamp>
+            <siri:RequestorRef>Test</siri:RequestorRef>
+            <OJPTripRequest>
+                <siri:RequestTimestamp>2026-07-02T08:00:00.000Z</siri:RequestTimestamp>
+                <siri:MessageIdentifier>TR-it-1</siri:MessageIdentifier>
+                <Origin>
+                    <PlaceRef>
+                        <siri:StopPointRef>8500994</siri:StopPointRef>
+                    </PlaceRef>
+                    <DepArrTime>2026-07-03T08:00:00.000Z</DepArrTime>
+                </Origin>
+                <Destination>
+                    <PlaceRef>
+                        <siri:StopPointRef>8574834</siri:StopPointRef>
+                    </PlaceRef>
+                </Destination>
+                <Params>
+                    <NumberOfResults>3</NumberOfResults>
+                    </Params>
+            </OJPTripRequest>
+        </siri:ServiceRequest>
+    </OJPRequest>
+</OJP>
