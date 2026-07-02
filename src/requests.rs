@@ -36,6 +36,10 @@ pub enum RequestError {
     InvalidNumberResults(u32),
     #[error("Http request error: {0}")]
     ReqwestError(#[from] reqwest::Error),
+    #[error(
+        "{0} is not a valid local time for the current timezone offset (falls in a DST gap or overlap)"
+    )]
+    InvalidLocalDateTime(NaiveDateTime),
 }
 
 impl TryFrom<RequestType> for String {
@@ -63,16 +67,17 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    pub fn new(date_time: NaiveDateTime) -> Self {
-        // We convert NaiveDateTime to Utc through Local (for the offset)
-        // First we get the "now" local time (used for the offset)
-        // and add it to the NaiveDateTime
-        let date_time = date_time
-            .and_local_timezone(*Local::now().offset())
-            .unwrap();
+    pub fn try_new(date_time: NaiveDateTime) -> Result<Self, RequestError> {
+        // We convert NaiveDateTime to Utc through Local (for the offset). `Local` resolves the
+        // offset that applies to `date_time` itself (accounting for DST rules across the year),
+        // rather than the offset currently in effect.
+        let local_date_time = date_time
+            .and_local_timezone(Local)
+            .single()
+            .ok_or(RequestError::InvalidLocalDateTime(date_time))?;
 
-        let date_time = date_time.to_utc();
-        RequestBuilder {
+        let date_time = local_date_time.to_utc();
+        Ok(RequestBuilder {
             date_time,
             token: None,
             request_type: RequestType::Unknown,
@@ -81,7 +86,7 @@ impl RequestBuilder {
             to: None,
             name: None,
             requestor_ref: String::new(),
-        }
+        })
     }
 
     pub fn set_from(mut self, from: i32) -> Self {
@@ -130,21 +135,23 @@ impl RequestBuilder {
                 if number_results == 0 {
                     return Err(RequestError::InvalidNumberResults(number_results));
                 }
-                if self.name.is_none() {
+                let Some(name) = self.name.as_ref() else {
                     return Err(RequestError::MissingLocationName);
-                }
+                };
+                let requestor_ref = quick_xml::escape::escape(self.requestor_ref.as_str());
+                let name = quick_xml::escape::escape(name.as_str());
                 let req = format!(
 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
                             <OJP xmlns=\"http://www.vdv.de/ojp\" xmlns:siri=\"http://www.siri.org.uk/siri\" version=\"2.0\">
                              	<OJPRequest>
                                     <siri:ServiceRequest>
                                         <siri:RequestTimestamp>{now}</siri:RequestTimestamp>
-                                        <siri:RequestorRef>{}</siri:RequestorRef>
+                                        <siri:RequestorRef>{requestor_ref}</siri:RequestorRef>
                                         <OJPLocationInformationRequest>
                                         <siri:RequestTimestamp>{now}</siri:RequestTimestamp>
                                         <siri:MessageIdentifier>LIR-1a</siri:MessageIdentifier>
                                         <InitialInput>
-                                            <Name>{}</Name>
+                                            <Name>{name}</Name>
                                         </InitialInput>
                                         <Restrictions>
                                             <Type>stop</Type>
@@ -153,7 +160,7 @@ impl RequestBuilder {
                                     </OJPLocationInformationRequest>
                                     </siri:ServiceRequest>
                                 </OJPRequest>
-                            </OJP>", self.requestor_ref, self.name.as_ref().unwrap());
+                            </OJP>");
                 Ok(req)
             }
             RequestType::StopEvent => Err(RequestError::EventsRequestTypeNotImplemented),
@@ -167,12 +174,13 @@ impl RequestBuilder {
                     (Some(_), None) => return Err(RequestError::MissingToId),
                     (None, Some(_)) => return Err(RequestError::MissingFromId),
                 };
+                let requestor_ref = quick_xml::escape::escape(self.requestor_ref.as_str());
                 let req = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>
                             <OJP xmlns=\"http://www.vdv.de/ojp\" xmlns:siri=\"http://www.siri.org.uk/siri\" version=\"2.0\">
                              	<OJPRequest>
                                     <siri:ServiceRequest>
                                         <siri:RequestTimestamp>{now}</siri:RequestTimestamp>
-                                        <siri:RequestorRef>{}</siri:RequestorRef>
+                                        <siri:RequestorRef>{requestor_ref}</siri:RequestorRef>
                                         <OJPTripRequest>
                                             <siri:RequestTimestamp>{now}</siri:RequestTimestamp>
                                             <siri:MessageIdentifier>TR-1r1</siri:MessageIdentifier>
@@ -193,7 +201,7 @@ impl RequestBuilder {
                                         </OJPTripRequest>
                                     </siri:ServiceRequest>
                                 </OJPRequest>
-                            </OJP>", self.requestor_ref);
+                            </OJP>");
                 Ok(req)
             }
         }
@@ -273,5 +281,91 @@ impl Display for RequestBuilder {
             "NumberResults: {}, DateTime: {}, RequestorRef: {}, Token: {token}",
             self.number_results, self.date_time, self.requestor_ref
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use chrono::{NaiveDate, NaiveTime};
+
+    fn sample_date_time() -> NaiveDateTime {
+        NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2025, 7, 15).unwrap(),
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        )
+    }
+
+    #[test]
+    fn location_request_escapes_special_characters() {
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::LocationInformation)
+            .set_requestor_ref("<ref>&\"'")
+            .set_name("<name>&\"'")
+            .set_number_results(1)
+            .try_request_body()
+            .unwrap();
+
+        assert!(
+            body.contains("<siri:RequestorRef>&lt;ref&gt;&amp;&quot;&apos;</siri:RequestorRef>")
+        );
+        assert!(body.contains("<Name>&lt;name&gt;&amp;&quot;&apos;</Name>"));
+    }
+
+    #[test]
+    fn location_request_name_cannot_inject_sibling_elements() {
+        // Attempts to close </Name></InitialInput> early and splice in a sibling element.
+        let malicious = "</Name></InitialInput><Injected>pwned</Injected><InitialInput><Name>x";
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::LocationInformation)
+            .set_requestor_ref("ref")
+            .set_name(malicious)
+            .set_number_results(1)
+            .try_request_body()
+            .unwrap();
+
+        assert!(!body.contains("<Injected>"));
+        assert_eq!(body.matches("<InitialInput>").count(), 1);
+    }
+
+    #[test]
+    fn trip_request_escapes_requestor_ref() {
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::Trip)
+            .set_requestor_ref("<ref>&")
+            .set_from(1)
+            .set_to(2)
+            .set_number_results(1)
+            .try_request_body()
+            .unwrap();
+
+        assert!(body.contains("<siri:RequestorRef>&lt;ref&gt;&amp;</siri:RequestorRef>"));
+    }
+
+    #[test]
+    fn try_new_resolves_offset_for_given_date_not_now() {
+        // Regression test: try_new must resolve the UTC offset that applies to `date_time`
+        // itself (via `Local`), not the offset currently in effect (via `Local::now()`).
+        let date_time = sample_date_time();
+        let expected_utc = date_time
+            .and_local_timezone(Local)
+            .single()
+            .unwrap()
+            .to_utc();
+        let expected = expected_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+
+        let body = RequestBuilder::try_new(date_time)
+            .unwrap()
+            .set_request_type(RequestType::Trip)
+            .set_from(1)
+            .set_to(2)
+            .set_number_results(1)
+            .try_request_body()
+            .unwrap();
+
+        assert!(body.contains(&format!("<DepArrTime>{expected}</DepArrTime>")));
     }
 }
