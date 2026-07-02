@@ -3,7 +3,7 @@ use std::env::VarError;
 use std::fmt::Display;
 use std::num::ParseIntError;
 
-use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeDelta, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeDelta, Timelike, Utc};
 use futures::future::join_all;
 use quick_xml::DeError;
 use secrecy::SecretString;
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::{Level, span};
 
-use crate::{RequestBuilder, RequestType, requests::RequestError};
+use crate::{PersonalMode, RequestBuilder, RequestType, requests::RequestError};
 
 pub fn token(api_key: &str) -> Result<SecretString, OjpError> {
     let t = std::env::var(api_key)?;
@@ -99,8 +99,11 @@ fn sloid_to_didok(sloid: &str) -> Result<i32, OjpError> {
     let iso = parts[0].to_lowercase();
     let uic = iso_to_uic(iso.as_str()).ok_or_else(|| OjpError::FailedToConvertIsoCode(iso))?;
 
-    // Extract number and pad to 5 digits
-    let num_str = parts[3];
+    // Extract number and pad to 5 digits. Generated platform-level refs seen from the
+    // live API look like `ch:1:sloid:9068_gen:ch:1:sloid:9068:0:168099_pf:3CD`; there
+    // the fourth part is `9068_gen`, whose leading digits are the parent stop's SLOID
+    // number, so everything from the first `_` on is dropped.
+    let num_str = parts[3].split('_').next().unwrap_or(parts[3]);
     let num = num_str.parse::<i32>()?;
 
     let didok = format!("{}{:05}", uic, num);
@@ -345,6 +348,53 @@ impl OJP {
         join_all(ref_trips).await
     }
 
+    /// Finds all trips `from_id` to `to_id` departing after `date_time` using the OJP API.
+    /// For each mode in `it_modes` (walk, bike, car, ...) an additional monomodal trip is
+    /// requested, so the result mixes public-transport and individual-transport trips.
+    /// The name of the environment variable needs to be profived through the varibale `api_key`.
+    ///
+    /// Note: the Swiss endpoint has been observed to honour only one `it_modes` entry per
+    /// request (see `test_xml/testing.md`); send one request per mode if you need several.
+    pub async fn find_trips_with_modes(
+        from_id: i32,
+        to_id: i32,
+        date_time: NaiveDateTime,
+        number_results: u32,
+        requestor_ref: &str,
+        api_key: &str,
+        it_modes: &[PersonalMode],
+    ) -> Result<Vec<SimplifiedTrip>, OjpError> {
+        let response = RequestBuilder::try_new(date_time)?
+            .set_token(token(api_key)?)
+            .set_from(from_id)
+            .set_to(to_id)
+            .set_number_results(number_results)
+            .set_request_type(RequestType::Trip)
+            .set_requestor_ref(requestor_ref)
+            .set_it_modes(it_modes)
+            .send_request()
+            .await?;
+
+        let ojp = OJP::try_from(response.as_str())?;
+        if let Some(msg) = ojp.error() {
+            return Err(OjpError::FailedToFindTrip {
+                dep_id: from_id,
+                arr_id: to_id,
+                msg: msg.to_string(),
+            });
+        }
+
+        ojp.trips_departing_after(date_time)
+            .ok_or(OjpError::FailedToFindTrip {
+                dep_id: from_id,
+                arr_id: to_id,
+                msg: format!("No trip departing after {date_time} was found."),
+            })?
+            .into_iter()
+            .map(|tr| SimplifiedTrip::try_from(tr.trip()))
+            .collect()
+    }
+
     /// Finds `number_results` trip `from_id` to `to_id` at `date_time` using the OJP API.
     /// The name of the environment variable needs to be profived through the varibale `api_key`.
     pub async fn find_trip(
@@ -430,7 +480,17 @@ impl OJP {
     /// Returns all trips from the OJP response that are starting after `date_time`.
     /// `date_time` is interpreted as local wall-clock time
     pub fn trips_departing_after(&self, date_time: NaiveDateTime) -> Option<Vec<&TripResult>> {
-        let date_time_utc = date_time.and_local_timezone(Local).single()?.naive_utc();
+        // The threshold is truncated to the whole minute before comparing: the service
+        // starts monomodal (ItModeToCover) trips exactly at the requested time, so a
+        // finer-grained threshold (e.g. from `Local::now()`) would wrongly exclude
+        // them; timetables work at minute granularity anyway. Trips departing up to
+        // 59 s before the requested instant are therefore included.
+        let date_time_utc = date_time
+            .and_local_timezone(Local)
+            .single()?
+            .naive_utc()
+            .with_second(0)?
+            .with_nanosecond(0)?;
         let res = self
             .trips()?
             .into_iter()
@@ -716,6 +776,15 @@ impl SimplifiedLeg {
             arrival_time,
             mode,
         }
+    }
+
+    /// The leg's transport mode. For individual-transport legs this is a
+    /// `PersonalMode` value (e.g. `"bicycle"`, parseable via
+    /// `str::parse::<PersonalMode>()`); for public-transport legs it is the mode name
+    /// from the timetable (e.g. `"Zug"`), and for transfer legs the transfer type
+    /// (e.g. `"walk"`).
+    pub fn mode(&self) -> &str {
+        self.mode.as_str()
     }
 }
 
@@ -1007,9 +1076,11 @@ pub struct ContinuousLeg {
     service: ContinuousService,
     #[serde(with = "duration")]
     duration: Duration,
-    length: i32,
-    leg_track: LegTrack,
-    path_guidance: PathGuidance,
+    // Monomodal trips requested via ItModeToCover come back with only the fields above
+    // (see test_xml/trip_bicycle.xml), so everything below must stay optional.
+    length: Option<i32>,
+    leg_track: Option<LegTrack>,
+    path_guidance: Option<PathGuidance>,
 }
 
 impl ContinuousLeg {
@@ -1301,7 +1372,9 @@ struct ExpectedDepartureOccupancy {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "PascalCase")]
 struct LegTrack {
-    track_section: TrackSection,
+    // maxOccurs="unbounded" in the OJP 2.0 schema (LegTrackStructure).
+    #[serde(rename = "TrackSection", default)]
+    track_sections: Vec<TrackSection>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1493,7 +1566,10 @@ struct PlaceMode {
 
 #[cfg(test)]
 mod test {
-    use crate::{OJP, OjpError, RequestBuilder, RequestType, SimplifiedLeg, SimplifiedTrip, token};
+    use crate::{
+        OJP, OjpError, PersonalMode, RequestBuilder, RequestType, SimplifiedLeg, SimplifiedTrip,
+        token,
+    };
     use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
     use std::error::Error;
     use test_log::test;
@@ -1512,7 +1588,14 @@ mod test {
         // Real StopPlaceRef seen from the live API for "Bern Bümpliz Süd".
         assert_eq!(super::sloid_to_didok("ch:1:sloid:4106").unwrap(), 8504106);
         assert_eq!(super::sloid_to_didok("de:1:sloid:42").unwrap(), 8000042);
+        // Generated platform-level ref (see test_xml/trip_generated_sloid.xml): the
+        // digits before `_gen` are the parent stop's SLOID number.
+        assert_eq!(
+            super::sloid_to_didok("ch:1:sloid:9068_gen:ch:1:sloid:9068:0:168099_pf:3CD").unwrap(),
+            8509068
+        );
         assert!(super::sloid_to_didok("not-a-sloid").is_err());
+        assert!(super::sloid_to_didok("ch:1:sloid:_gen").is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1709,6 +1792,150 @@ mod test {
         let _ojp = parse_xml("test_xml/trip_lots.xml").unwrap();
     }
 
+    /// Parses an ItModeToCover fixture (see `test_xml/testing.md`), asserts it holds
+    /// `expected_trips` trip results that all convert to `SimplifiedTrip`, and returns
+    /// the single-leg monomodal trip with `mode`.
+    fn monomodal_trip_from_fixture(
+        fixture: &str,
+        mode: PersonalMode,
+        expected_trips: usize,
+    ) -> SimplifiedTrip {
+        let ojp = parse_xml(fixture).unwrap();
+        let trips = ojp.trips().unwrap();
+        assert_eq!(trips.len(), expected_trips);
+
+        let simplified: Vec<_> = trips
+            .iter()
+            .map(|t| SimplifiedTrip::try_from(t.trip()).unwrap())
+            .collect();
+        let monomodal = simplified
+            .into_iter()
+            .find(|st| st.legs()[0].mode == mode.as_str())
+            .unwrap_or_else(|| panic!("no monomodal {mode:?} trip in {fixture}"));
+        assert_eq!(monomodal.legs().len(), 1);
+        monomodal
+    }
+
+    #[test]
+    fn trip_foot() {
+        // Short distance (Zürich HB -> Zürich, Sihlquai/HB, 413 m; the endpoint only
+        // returns walk trips below a distance limit). Unlike the other monomodal
+        // fixtures, the walk ContinuousLeg carries a LegTrack and a PathGuidance with
+        // per-section TrackSections, pinning the richer variant of the structure.
+        let walk = monomodal_trip_from_fixture("test_xml/trip_foot.xml", PersonalMode::Foot, 2);
+        assert_eq!(walk.departure_id().unwrap(), 8503000);
+        assert_eq!(walk.arrival_id().unwrap(), 8591368);
+        assert_eq!(walk.duration().unwrap(), Duration::seconds(6 * 60 + 16));
+    }
+
+    #[test]
+    fn trips_departing_after_truncates_to_the_minute() {
+        // Regression test: monomodal trips start exactly at the requested time (with
+        // at most millisecond precision, as echoed by the server), so a finer-grained
+        // threshold as produced by `Local::now()` must not exclude them. It used to:
+        // the bicycle trip starting at 08:00:00.000 lost against a threshold of
+        // 08:00:00.000000500 by less than a microsecond.
+        let ojp = parse_xml("test_xml/trip_bicycle.xml").unwrap();
+        let start_utc = NaiveDateTime::parse_from_str("2026-07-03T08:00:00Z", FORMAT).unwrap();
+        let threshold_local = start_utc.and_utc().with_timezone(&Local).naive_local()
+            + Duration::seconds(30)
+            + Duration::nanoseconds(500);
+
+        // The threshold 08:00:30.000000500 is truncated to 08:00:00, so all 5 trips
+        // survive the filter (4 public-transport ones departing later, plus the
+        // bicycle trip starting exactly at 08:00:00).
+        assert_eq!(ojp.trips_departing_after(threshold_local).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn trip_bicycle() {
+        // 4 public-transport trips plus one monomodal bicycle trip consisting of a
+        // single ContinuousLeg (no LegTrack/PathGuidance, no own timestamps).
+        let bike =
+            monomodal_trip_from_fixture("test_xml/trip_bicycle.xml", PersonalMode::Bicycle, 5);
+        // SLOID stop refs (ch:1:sloid:3000/3006) must convert to DIDOK ids.
+        assert_eq!(bike.departure_id().unwrap(), 8503000);
+        assert_eq!(bike.arrival_id().unwrap(), 8503006);
+        assert_eq!(bike.departure_stop().unwrap(), "Zürich HB");
+        assert_eq!(bike.arrival_stop().unwrap(), "Zürich Oerlikon");
+        // The ContinuousLeg has no timestamps of its own; they are derived from the
+        // trip's start time plus the leg duration (PT21M17S).
+        assert_eq!(
+            bike.departure_time().unwrap(),
+            NaiveDateTime::parse_from_str("2026-07-03T08:00:00Z", FORMAT).unwrap()
+        );
+        assert_eq!(bike.duration().unwrap(), Duration::seconds(21 * 60 + 17));
+    }
+
+    #[test]
+    fn trip_car() {
+        let car = monomodal_trip_from_fixture("test_xml/trip_car.xml", PersonalMode::Car, 5);
+        assert_eq!(car.departure_id().unwrap(), 8503000);
+        assert_eq!(car.arrival_id().unwrap(), 8503006);
+        assert_eq!(car.duration().unwrap(), Duration::seconds(7 * 60 + 44));
+    }
+
+    #[test]
+    fn trip_motorcycle() {
+        let motorcycle = monomodal_trip_from_fixture(
+            "test_xml/trip_motorcycle.xml",
+            PersonalMode::Motorcycle,
+            5,
+        );
+        assert_eq!(motorcycle.departure_id().unwrap(), 8503000);
+        assert_eq!(motorcycle.arrival_id().unwrap(), 8503006);
+        assert_eq!(
+            motorcycle.duration().unwrap(),
+            Duration::seconds(8 * 60 + 20)
+        );
+    }
+
+    #[test]
+    fn trip_scooter() {
+        let scooter =
+            monomodal_trip_from_fixture("test_xml/trip_scooter.xml", PersonalMode::Scooter, 5);
+        assert_eq!(scooter.departure_id().unwrap(), 8503000);
+        assert_eq!(scooter.arrival_id().unwrap(), 8503006);
+        assert_eq!(
+            scooter.duration().unwrap(),
+            Duration::seconds(3600 + 32 * 60 + 16)
+        );
+    }
+
+    #[test]
+    fn trip_truck() {
+        // The endpoint silently ignores `truck` (see test_xml/testing.md): the response
+        // is valid but contains only the public-transport trips. Pins both that such a
+        // response still parses and the ignore behaviour at capture time.
+        let ojp = parse_xml("test_xml/trip_truck.xml").unwrap();
+        let trips = ojp.trips().unwrap();
+        assert_eq!(trips.len(), 4);
+
+        let simplified: Vec<_> = trips
+            .iter()
+            .map(|t| SimplifiedTrip::try_from(t.trip()).unwrap())
+            .collect();
+        assert!(simplified.iter().all(|st| {
+            st.legs()
+                .iter()
+                .all(|l| l.mode != PersonalMode::Truck.as_str())
+        }));
+    }
+
+    #[test]
+    fn trip_generated_sloid() {
+        // Regression test: this response (Le Landeron 8500994 → Alle, Grands Prés
+        // 8574834) contains generated platform-level refs like
+        // `ch:1:sloid:9068_gen:ch:1:sloid:9068:0:168099_pf:3CD`, which used to fail
+        // SimplifiedTrip conversion with "invalid digit found in string".
+        let ojp = parse_xml("test_xml/trip_generated_sloid.xml").unwrap();
+        let trips = ojp.trips().unwrap();
+        assert_eq!(trips.len(), 5);
+        for t in trips {
+            SimplifiedTrip::try_from(t.trip()).unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[test_log::test]
     async fn request_location_information_service_simple() {
@@ -1728,6 +1955,46 @@ mod test {
             .await
             .unwrap();
         let _ojp = OJP::try_from(response.as_str()).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[test_log::test]
+    async fn request_trip_with_every_personal_mode() {
+        dotenvy::dotenv().ok(); // optional
+        let date_time = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        );
+        // One request per mode: the Swiss endpoint honours only a single ItModeToCover
+        // per request (see test_xml/testing.md). Most modes use Zürich HB -> Oerlikon
+        // (~4.7 km); foot must stay within the endpoint's walking-distance policy, so it
+        // uses Zürich HB -> Sihlquai/HB (413 m). The bool records whether the endpoint
+        // returns a monomodal trip for that mode: truck is silently ignored (plain
+        // public-transport results come back), so only the round trip is verified there.
+        let cases = [
+            (PersonalMode::Foot, 8591368, true),
+            (PersonalMode::Bicycle, 8503006, true),
+            (PersonalMode::Car, 8503006, true),
+            (PersonalMode::Motorcycle, 8503006, true),
+            (PersonalMode::Truck, 8503006, false),
+            (PersonalMode::Scooter, 8503006, true),
+        ];
+        for (mode, to_id, returns_monomodal_trip) in cases {
+            let trips =
+                OJP::find_trips_with_modes(8503000, to_id, date_time, 3, "Test", "TOKEN", &[mode])
+                    .await
+                    .unwrap();
+
+            assert!(!trips.is_empty(), "no trips at all for {mode:?}");
+            if returns_monomodal_trip {
+                assert!(
+                    trips
+                        .iter()
+                        .any(|t| t.legs().iter().any(|l| l.mode == mode.as_str())),
+                    "expected a monomodal {mode:?} trip among the results"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

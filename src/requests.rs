@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::str::FromStr;
 
 use chrono::{DateTime, Local, NaiveDateTime, SecondsFormat, Utc};
 use reqwest::Client;
@@ -14,6 +15,58 @@ pub enum RequestType {
     Trip,
     StopEvent,
     Unknown,
+}
+
+/// Individual ("personal") transport mode, as defined by the OJP 2.0
+/// `PersonalModesEnumeration`. Used with [`RequestBuilder::set_it_modes`] to request
+/// monomodal trips (e.g. a pure bicycle route) in addition to public-transport results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonalMode {
+    Foot,
+    Bicycle,
+    Car,
+    Motorcycle,
+    Truck,
+    Scooter,
+}
+
+impl PersonalMode {
+    /// The value used in the request XML (`<PersonalMode>` element).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PersonalMode::Foot => "foot",
+            PersonalMode::Bicycle => "bicycle",
+            PersonalMode::Car => "car",
+            PersonalMode::Motorcycle => "motorcycle",
+            PersonalMode::Truck => "truck",
+            PersonalMode::Scooter => "scooter",
+        }
+    }
+}
+
+impl Display for PersonalMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PersonalMode {
+    type Err = RequestError;
+
+    /// Parses an OJP 2.0 `PersonalModesEnumeration` value — the same strings produced
+    /// by [`PersonalMode::as_str`] and found in response elements such as a
+    /// `ContinuousLeg`'s `<PersonalMode>` (surfaced as `SimplifiedLeg`'s `mode`).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "foot" => Ok(PersonalMode::Foot),
+            "bicycle" => Ok(PersonalMode::Bicycle),
+            "car" => Ok(PersonalMode::Car),
+            "motorcycle" => Ok(PersonalMode::Motorcycle),
+            "truck" => Ok(PersonalMode::Truck),
+            "scooter" => Ok(PersonalMode::Scooter),
+            _ => Err(RequestError::UnknownPersonalMode(s.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -34,6 +87,8 @@ pub enum RequestError {
     EventsRequestTypeNotImplemented,
     #[error("Invalid number of results, got {0}, should be > 0.")]
     InvalidNumberResults(u32),
+    #[error("Unknown personal mode: {0}")]
+    UnknownPersonalMode(String),
     #[error("Http request error: {0}")]
     ReqwestError(#[from] reqwest::Error),
     #[error(
@@ -64,6 +119,7 @@ pub struct RequestBuilder {
     to: Option<i32>,
     name: Option<String>,
     requestor_ref: String,
+    it_modes: Vec<PersonalMode>,
 }
 
 impl RequestBuilder {
@@ -86,6 +142,7 @@ impl RequestBuilder {
             to: None,
             name: None,
             requestor_ref: String::new(),
+            it_modes: Vec::new(),
         })
     }
 
@@ -121,6 +178,17 @@ impl RequestBuilder {
 
     pub fn set_requestor_ref(mut self, requestor_ref: &str) -> Self {
         self.requestor_ref = requestor_ref.to_string();
+        self
+    }
+
+    /// Requests one additional monomodal trip per mode (walk, bike, car, ...) alongside
+    /// the public-transport results of a Trip request. Ignored for other request types.
+    ///
+    /// Note: the Swiss OJP 2.0 endpoint has been observed to honour only a single
+    /// `ItModeToCover` per request; pass one mode (or send one request per mode) if you
+    /// need reliable results.
+    pub fn set_it_modes(mut self, it_modes: &[PersonalMode]) -> Self {
+        self.it_modes = it_modes.to_vec();
         self
     }
 
@@ -175,6 +243,15 @@ impl RequestBuilder {
                     (None, Some(_)) => return Err(RequestError::MissingFromId),
                 };
                 let requestor_ref = quick_xml::escape::escape(self.requestor_ref.as_str());
+                // Values come from the closed PersonalMode enum, so no escaping is needed.
+                // Schema order (TripPolicyGroup): ItModeToCover follows NumberOfResults.
+                let it_modes = self
+                    .it_modes
+                    .iter()
+                    .map(|m| {
+                        format!("<ItModeToCover><PersonalMode>{m}</PersonalMode></ItModeToCover>")
+                    })
+                    .collect::<String>();
                 let req = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>
                             <OJP xmlns=\"http://www.vdv.de/ojp\" xmlns:siri=\"http://www.siri.org.uk/siri\" version=\"2.0\">
                              	<OJPRequest>
@@ -197,6 +274,7 @@ impl RequestBuilder {
                                             </Destination>
                                             <Params>
                                                 <NumberOfResults>{number_results}</NumberOfResults>
+                                                {it_modes}
                                             </Params>
                                         </OJPTripRequest>
                                     </siri:ServiceRequest>
@@ -268,6 +346,9 @@ impl Display for RequestBuilder {
                         .map(|i| format!("{i}"))
                         .unwrap_or("Undefined".to_string()),
                 )?;
+                if !self.it_modes.is_empty() {
+                    write!(f, "ItModes: {:?}, ", self.it_modes)?;
+                }
             }
             RequestType::StopEvent => {
                 write!(f, "Stop Envent Request Not Implement. ")?;
@@ -343,6 +424,93 @@ mod test {
             .unwrap();
 
         assert!(body.contains("<siri:RequestorRef>&lt;ref&gt;&amp;</siri:RequestorRef>"));
+    }
+
+    #[test]
+    fn trip_request_includes_it_modes_after_number_of_results() {
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::Trip)
+            .set_from(1)
+            .set_to(2)
+            .set_number_results(3)
+            .set_it_modes(&[PersonalMode::Bicycle, PersonalMode::Car])
+            .try_request_body()
+            .unwrap();
+
+        assert!(
+            body.contains("<ItModeToCover><PersonalMode>bicycle</PersonalMode></ItModeToCover>")
+        );
+        assert!(body.contains("<ItModeToCover><PersonalMode>car</PersonalMode></ItModeToCover>"));
+        // The schema requires ItModeToCover to come after NumberOfResults inside Params.
+        let number_results_pos = body.find("<NumberOfResults>").unwrap();
+        let it_mode_pos = body.find("<ItModeToCover>").unwrap();
+        assert!(number_results_pos < it_mode_pos);
+    }
+
+    /// Every PersonalMode variant. A new variant must be added here.
+    const ALL_MODES: [PersonalMode; 6] = [
+        PersonalMode::Foot,
+        PersonalMode::Bicycle,
+        PersonalMode::Car,
+        PersonalMode::Motorcycle,
+        PersonalMode::Truck,
+        PersonalMode::Scooter,
+    ];
+
+    #[test]
+    fn personal_mode_string_round_trip() {
+        for mode in ALL_MODES {
+            assert_eq!(mode.to_string().parse::<PersonalMode>().unwrap(), mode);
+        }
+        // Pin the wire values of the OJP 2.0 PersonalModesEnumeration in one place:
+        // a round trip alone would still pass if `as_str` and `from_str` drifted from
+        // the spec together.
+        assert_eq!(
+            ALL_MODES.map(PersonalMode::as_str),
+            ["foot", "bicycle", "car", "motorcycle", "truck", "scooter"]
+        );
+        assert!(matches!(
+            "plane".parse::<PersonalMode>(),
+            Err(RequestError::UnknownPersonalMode(s)) if s == "plane"
+        ));
+    }
+
+    #[test]
+    fn trip_request_emits_every_personal_mode() {
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::Trip)
+            .set_from(1)
+            .set_to(2)
+            .set_number_results(3)
+            .set_it_modes(&ALL_MODES)
+            .try_request_body()
+            .unwrap();
+
+        for mode in ALL_MODES {
+            assert!(
+                body.contains(&format!(
+                    "<ItModeToCover><PersonalMode>{mode}</PersonalMode></ItModeToCover>"
+                )),
+                "missing ItModeToCover for {mode:?}"
+            );
+        }
+        assert_eq!(body.matches("<ItModeToCover>").count(), ALL_MODES.len());
+    }
+
+    #[test]
+    fn trip_request_without_it_modes_omits_element() {
+        let body = RequestBuilder::try_new(sample_date_time())
+            .unwrap()
+            .set_request_type(RequestType::Trip)
+            .set_from(1)
+            .set_to(2)
+            .set_number_results(3)
+            .try_request_body()
+            .unwrap();
+
+        assert!(!body.contains("ItModeToCover"));
     }
 
     #[test]
